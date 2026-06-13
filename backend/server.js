@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -11,14 +10,8 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
-// ====================================
-// Groq AI Setup
-// ====================================
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-// ====================================
-// Upload Folder
-// ====================================
 if (!fs.existsSync("uploads")) fs.mkdirSync("uploads");
 
 const storage = multer.diskStorage({
@@ -27,9 +20,6 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// ====================================
-// Helpers
-// ====================================
 function detectType(values) {
   const filtered = values.filter((v) => v !== undefined && v !== null && v !== "");
   if (filtered.length === 0) return "Unknown";
@@ -63,9 +53,6 @@ function getBasicStats(values, type) {
   return stats;
 }
 
-// ====================================
-// Groq AI: Data Dictionary
-// ====================================
 async function generateAIDataDictionary(columns, sampleRows, basicMeta) {
   const sampleData = JSON.stringify(sampleRows.slice(0, 5), null, 2);
   const metaSummary = basicMeta.map((m) =>
@@ -191,24 +178,13 @@ app.post("/upload", upload.single("dataset"), async (req, res) => {
 });
 
 // ====================================
-// Chat Route — Returns text + chartData
+// Chat Route
 // ====================================
 app.post("/chat", async (req, res) => {
   const { question, chatHistory = [] } = req.body;
-
-  if (!global.currentDataset) {
-    return res.json({ answer: "Please upload a dataset first.", chartData: null });
-  }
+  if (!global.currentDataset) return res.json({ answer: "Please upload a dataset first.", chartData: null });
 
   const { rows, columns, metadata, summary, aiData } = global.currentDataset;
-
-  // Pre-compute column value distributions for charts
-  const colDistributions = {};
-  metadata.forEach((m) => {
-    if (m.stats.topValuesArr) {
-      colDistributions[m.column.toLowerCase()] = m.stats.topValuesArr;
-    }
-  });
 
   const dataContext = `
 Dataset: ${summary.datasetName}
@@ -249,30 +225,20 @@ ${dataContext}`;
 
   try {
     const completion = await groq.chat.completions.create({
-      messages,
-      model: "llama-3.3-70b-versatile",
-      temperature: 0.4,
-      max_tokens: 1200,
+      messages, model: "llama-3.3-70b-versatile", temperature: 0.4, max_tokens: 1200,
     });
 
     const raw = completion.choices[0].message.content;
-
-    // Extract chart data if present
     let chartData = null;
     let answer = raw;
 
     const chartMatch = raw.match(/CHART_DATA:(\{.*\})/s);
     if (chartMatch) {
-      try {
-        chartData = JSON.parse(chartMatch[1]);
-        answer = raw.replace(/CHART_DATA:.*$/s, "").trim();
-      } catch (e) {
-        chartData = null;
-      }
+      try { chartData = JSON.parse(chartMatch[1]); answer = raw.replace(/CHART_DATA:.*$/s, "").trim(); }
+      catch (e) { chartData = null; }
     }
 
     return res.json({ answer, chartData });
-
   } catch (err) {
     console.error("Chat error:", err.message);
     return res.status(500).json({ answer: "AI temporarily unavailable. Try again.", chartData: null });
@@ -302,9 +268,7 @@ Sample values: ${sampleVals.join(", ")}`;
   try {
     const completion = await groq.chat.completions.create({
       messages: [{ role: "user", content: prompt }],
-      model: "llama-3.3-70b-versatile",
-      temperature: 0.3,
-      max_tokens: 300,
+      model: "llama-3.3-70b-versatile", temperature: 0.3, max_tokens: 300,
     });
     res.json({ insight: completion.choices[0].message.content });
   } catch (err) {
@@ -313,11 +277,10 @@ Sample values: ${sampleVals.join(", ")}`;
 });
 
 // ====================================
-// Anomaly Detection Route
+// Anomaly Detection
 // ====================================
 app.post("/anomalies", async (req, res) => {
   if (!global.currentDataset) return res.json({ anomalies: [] });
-
   const { metadata, rows } = global.currentDataset;
   const anomalies = [];
 
@@ -330,15 +293,105 @@ app.post("/anomalies", async (req, res) => {
       const outliers = values.filter((v) => Math.abs(v - mean) > 3 * std).length;
       if (outliers > 0) anomalies.push({ column: m.column, issue: `${outliers} outliers detected (>3σ from mean ${parseFloat(mean.toFixed(2))})`, severity: outliers > 5 ? "high" : "medium" });
     }
-    if (parseFloat(m.stats.missingPct) > 20) {
-      anomalies.push({ column: m.column, issue: `High missing data: ${m.stats.missingPct}%`, severity: "high" });
-    }
-    if (m.stats.unique === 1) {
-      anomalies.push({ column: m.column, issue: "Only 1 unique value — constant column", severity: "high" });
-    }
+    if (parseFloat(m.stats.missingPct) > 20) anomalies.push({ column: m.column, issue: `High missing data: ${m.stats.missingPct}%`, severity: "high" });
+    if (m.stats.unique === 1) anomalies.push({ column: m.column, issue: "Only 1 unique value — constant column", severity: "high" });
   });
 
   res.json({ anomalies });
+});
+
+// ====================================
+// 🕵️ Data Detective Route
+// ====================================
+app.post("/detective", async (req, res) => {
+  if (!global.currentDataset) return res.json({ report: "No dataset loaded." });
+  const { metadata, summary } = global.currentDataset;
+
+  const suspects = metadata
+    .filter(m => parseFloat(m.stats?.missingPct) > 5 || m.stats?.unique === 1)
+    .map(m => `${m.column}: missing=${m.stats?.missingPct}%, unique=${m.stats?.unique}`)
+    .join("\n");
+
+  const prompt = `You are Detective MetaMind, a dramatic data science detective. Write a SHORT crime investigation report about this dataset.
+
+Dataset: ${summary.datasetName}
+Total Rows: ${summary.totalRows}
+Quality Score: ${summary.qualityScore}%
+Duplicate Rows: ${summary.duplicateRows}
+Missing Data: ${summary.missingPercentage}%
+
+Suspicious Columns (potential criminals):
+${suspects || "No major suspects found — dataset is clean!"}
+
+Write a fun detective report with these exact sections:
+🔍 CASE OVERVIEW (1 sentence about this dataset)
+🚨 PRIMARY SUSPECT (worst column, why it's guilty)
+🤝 ACCOMPLICES (other bad columns, max 2, or "No accomplices" if clean)
+💀 VICTIM (what suffers because of bad data quality)
+⚖️ VERDICT (guilty/not guilty with reason)
+🔫 DETECTIVE'S ORDERS (exact 3 cleaning steps needed)
+
+Be dramatic and fun, use crime metaphors. Give REAL data science advice in detective style. Under 220 words total.`;
+
+  try {
+    const completion = await groq.chat.completions.create({
+      messages: [{ role: "user", content: prompt }],
+      model: "llama-3.3-70b-versatile",
+      temperature: 0.85,
+      max_tokens: 600,
+    });
+    res.json({ report: completion.choices[0].message.content });
+  } catch (err) {
+    console.error("Detective error:", err.message);
+    res.json({ report: "Detective is unavailable right now. Try again!" });
+  }
+});
+
+// ====================================
+// 🔮 Data Horoscope Route
+// ====================================
+app.post("/horoscope", async (req, res) => {
+  if (!global.currentDataset) return res.json({ horoscope: "No dataset loaded." });
+  const { metadata, summary } = global.currentDataset;
+
+  const numericCols = metadata.filter(m => m.type === "Integer" || m.type === "Float").map(m => m.column).join(", ");
+  const textCols = metadata.filter(m => m.type === "String").map(m => m.column).join(", ");
+  const targetCol = metadata.find(m => m.relationship?.includes("Target"))?.column || "not identified";
+
+  const prompt = `You are a mystical data science astrologer. Generate a fun horoscope for this dataset.
+
+Dataset: ${summary.datasetName}
+Type: ${summary.datasetType}
+Quality Score: ${summary.qualityScore}%
+Missing Data: ${summary.missingPercentage}%
+Numeric Columns: ${numericCols || "none"}
+Text Columns: ${textCols || "none"}
+Target Variable: ${targetCol}
+Duplicates: ${summary.duplicateRows}
+Total Rows: ${summary.totalRows}
+
+Write a mystical horoscope with these exact sections:
+⭐ STAR SIGN (assign a zodiac sign based on dataset personality, explain why in 1 line)
+🔮 TODAY'S READING (overall dataset destiny, 2 sentences, mystical but real advice)
+🍀 LUCKY ALGORITHM (best ML algorithm for this data with brief reason)
+⚠️ WARNING FROM THE STARS (biggest data problem to watch out for)
+💕 COMPATIBILITY (which other dataset type would pair well and why)
+🙏 SACRED MANTRA (one powerful data cleaning tip as a short mantra)
+
+Be mystical and fun, use astrology metaphors but give REAL data science advice. Under 220 words total.`;
+
+  try {
+    const completion = await groq.chat.completions.create({
+      messages: [{ role: "user", content: prompt }],
+      model: "llama-3.3-70b-versatile",
+      temperature: 0.9,
+      max_tokens: 600,
+    });
+    res.json({ horoscope: completion.choices[0].message.content });
+  } catch (err) {
+    console.error("Horoscope error:", err.message);
+    res.json({ horoscope: "The stars are unclear right now. Try again!" });
+  }
 });
 
 app.get("/", (req, res) => res.send("MetaMind AI Backend 🚀 - Groq Powered"));
